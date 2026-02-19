@@ -15,6 +15,11 @@ from tokenizers.pre_tokenizers import Whitespace
 from tokenizers.trainers import BpeTrainer 
 from tokenizers.decoders import BPEDecoder 
 
+# jax 
+import jax 
+import jax.numpy as jnp
+
+
 from typing import Any
 from tqdm.auto import tqdm 
 
@@ -232,7 +237,42 @@ def project_to_static_shape(
     print(f'Saved dataset to: {save_path=}')
     return static_dataset
 
-def run_data_config_pipeline() -> None :
+def build_jax_dataloader(
+        dataset:Dataset, 
+        batch_size:int,
+        prng_key:jax.Array, 
+        drop_last:bool=True
+    ) -> Iterator[np.ndarray] :
+    """ Generator to yield batches of data for jax """
+
+    dataset_len:int = len(dataset)
+    # we create shuffled indices for out dataset using jax backend ("cuda")
+    shuffled_indices = jax.random.permutation(prng_key, jnp.arange(dataset_len))
+    # cast back to numpy array to avoid host memory transfers in each epoch of python iteration 
+    shuffled_indices = np.array(shuffled_indices)
+
+    # boundary for dropping last batch or not 
+    num_batches:int = dataset_len // batch_size
+    if not drop_last and dataset_len % batch_size != 0: num_batches += 1
+
+    # streaming data for iteration in batches
+    for i in range(num_batches):
+        start_idx:int = i * batch_size 
+        end_idx:int = min((i+1) * batch_size, dataset_len)
+
+        # slicing the index shuffled array 
+        batch_indices = shuffled_indices[start_idx:end_idx]
+        batch_data = dataset[batch_indices.tolist()] # select the batch data using the shuffled indices
+
+        # project python list to contiguous numpy array 
+        en_batch = np.array(batch_data['en'], dtype=np.int32)
+        hi_batch = np.array(batch_data['hi'], dtype=np.int32)
+
+        # stacking and returning to shape (BatchSize, 2, max_seq_len)
+        yield np.stack([en_batch, hi_batch], axis=0)
+
+def run_data_config_pipeline(data_iterator:bool=False, batch_size:int=64) -> None | Iterator[np.ndarray] :
+
     prettify = lambda: print("*"*70)
     #loading iitb data 
     df:DatasetDict = load_iitb_data(datapath=RAW_DATA_PATH)
@@ -302,6 +342,22 @@ def run_data_config_pipeline() -> None :
     print(f"Shape of first training sample (en, hi): ({len(jax_ready_data['train'][dummy_index]['en'])}, {len(jax_ready_data['train'][dummy_index]['hi'])})")
     print(f"Tokeniser decoded sample English text: {tokeniser.decode(jax_ready_data['train'][dummy_index]['en'])}")
     print(f"Tokeniser decoded sample Hindi text: {tokeniser.decode(jax_ready_data['train'][dummy_index]['hi'])}"); prettify()
+
+    # getting jax data loader which loads batch of numpy array
+    prng_key = jax.random.PRNGKey(744)
+    dataloader = build_jax_dataloader(jax_ready_data['train'], batch_size=batch_size, prng_key=prng_key, drop_last=True) # type:ignore 
+    print(f"JAX dataloader built successfully. Sample batch shape:") 
+    sample_batch = next(dataloader)
+    print(f"Shape of sample batch: {sample_batch.shape}")  # Should be (BatchSize, 2, max_seq_len)
+    print(f"Sample batch (first sentence in English and Hindi):")
+    print(f"English token IDs: {sample_batch[0,0,:10]}")  # Print first 10 token IDs of the first English sentence in the batch
+    print(f"Hindi token IDs: {sample_batch[0,1,:10]}")  # Print first 10 token IDs of the first Hindi sentence in the batch
+    print(f"Decoded English text from token IDs: {tokeniser.decode(sample_batch[0,0,:10].tolist())}")
+    print(f"Decoded Hindi text from token IDs: {tokeniser.decode(sample_batch[1,0,:10].tolist())}"); prettify()
+
+    if data_iterator: return dataloader
+    else: return None
+
 
 if __name__ == "__main__":
     run_data_config_pipeline()

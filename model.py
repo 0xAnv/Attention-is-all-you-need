@@ -20,6 +20,33 @@ from data import run_data_config_pipeline
 ###########################################################################
 #                     MODEL BLOCKS
 ###########################################################################
+
+class PositionalEncoding(nn.Module):
+    """
+    Injects temporal inductive bias into the embedding vectors via deterministic multi scale fourier frequencies 
+    Pre-computes the encoding matrix to eliminate forward pass trigonometric FLOP overhead 
+    """
+    def __init__(self, d_model:int, max_len:int=5_000, dtype:jnp.dtype=jnp.bfloat16) -> None:
+        super().__init__()
+
+        # precomputes the structural tensor in float32 for high precision math 
+        pe = jnp.zeros((max_len, d_model), dtype=jnp.float32)  
+        # positional indices : (max_len, 1)
+        position = jnp.arange(0, max_len, dtype=jnp.float32)[:,jnp.newaxis] 
+        # Frequency Exponential scaling 
+        div_term = jnp.exp(jnp.arange(0, d_model, 2, dtype=jnp.float32) * -(jnp.log(10000.0)/d_model))
+        # Apply sin to even indices and cos to odd indices using JAX .at sytax 
+        pe = pe.at[:, 0::2].set(jnp.sin(position*div_term))
+        pe = pe.at[:, 1::2].set(jnp.cos(position*div_term))
+        # Expand batch dimension for XLA broadcasting then cast down to bfloat16 to save bandwidth 
+        self.pe_cache = pe[jnp.newaxis,:, :].astype(dtype=dtype) # (1, max_len, d_model)
+
+    def __call__(self, x:jax.Array) -> jax.Array:
+        # x shape: (batch, seqLength, d_model) 
+        seq_len=x.shape[1]
+        # slice the cache upto seq_len and brodcast 
+        return x + self.pe_cache[:, :seq_len, :]
+    
 class MultiHeadSelfAttention(nn.Module):
     """
     RTX 3060 optimised multi-head self attention module.
@@ -168,6 +195,32 @@ class EncoderBlock(nn.Module):
         x = x + ffn_out # residual connection 
         return x 
 
+class TransformerEmbedding(nn.Module): 
+    """
+    Combines discrete token lookup with continuos positional embedding using embedding lookup table
+    """
+    def __init__(self, vocab_size:int, d_model:int, max_seq_len:int, dropout_rate:float, rngs:nn.Rngs, dtype:jnp.dtype=jnp.bfloat16): 
+        super().__init__() 
+        self.d_model = d_model 
+
+        self.token_embed = nn.Embed(num_embeddings=vocab_size, features=d_model, param_dtype=dtype, dtype=dtype, rngs=rngs) # our lookup table 
+        self.positional_encoding = PositionalEncoding(d_model=d_model, max_len=max_seq_len, dtype=dtype)
+        self.dropout = nn.Dropout(rate=dropout_rate, rngs=rngs) 
+    
+    def __call__(self, x: jax.Array, deterministic:bool = False) -> jax.Array:
+        """
+        x : Integer array of shape (batch, seq_len)
+        """
+        # lookup tokens 
+        x_emb = self.token_embed(inputs=x)
+        # scale up token embedding to match variance of pos encodings
+        # without this, pos signal dominates the semantic signal 
+        x_emb = x_emb * jnp.sqrt(jnp.array(self.d_model, dtype=x_emb.dtype)) 
+        # Inject temporal inductive bias of positonal trigonometric waves 
+        x_pe = self.positional_encoding(x_emb) 
+        # Apply stochastic regularisation 
+        return self.dropout(x_pe, deterministic=deterministic)
+
 
 ###########################################################################
 #                     MODULE TESTING FUNCTIONS
@@ -255,8 +308,38 @@ def test_encoder_block() -> nn.Module:
     
     return encoder_block
 
+# testing embedding layer 
+def test_embedding_layer():
+    B:int = 32 
+    L:int = 128 
+    d_model:int = 512 
+    vocab_size:int = 32_000 # Matching the BPE tokeniser vocab we trained 
+
+    # intialise nnx state with params and dropout streams 
+    rngs = nn.Rngs(dropout=42, params=42) 
+
+    # instantiate the embedding sub system 
+    embed_layer = TransformerEmbedding(vocab_size=vocab_size, d_model=d_model, max_seq_len=1024, dropout_rate=0.1, rngs=rngs, dtype=jnp.bfloat16)
+    
+    # dummy input of integer token ids simulating jax dataloader output
+    key = jax.random.PRNGKey(0) 
+    # token ids must strict be integers in range [0, vocab_size-1] 
+    dummy_input_ids = jax.random.randint(key, shape=(B, L), minval=0, maxval=vocab_size) 
+    print("--- Transformer Embedding Pass ---")
+    print(f"Discrete Input shape (B, L): {dummy_input_ids.shape} | dtype: {dummy_input_ids.dtype}")
+    
+    # Forward pass mapping integers to continuous vectors
+    output_embeddings = embed_layer(dummy_input_ids, deterministic=False)
+    
+    print(f"Continuous Output shape (B, L, d_model): {output_embeddings.shape} | dtype: {output_embeddings.dtype}")
+    
+    # Assert structural invariants
+    assert output_embeddings.shape == (B, L, d_model), "Embedding failed to project to d_model manifold"
+    assert output_embeddings.dtype == jnp.bfloat16, "Precision constraint violated"
+    print("Embedding projection and symmetry breaking passed.")
 
 if __name__ =="__main__":
     prettify = lambda : print("*"*50)
     print("Testing multi head attention"); test_mha(); prettify()
     print("Testing Encoder Block"); test_encoder_block(); prettify()
+    print("Testing Embedding Layer"); test_embedding_layer(); prettify()

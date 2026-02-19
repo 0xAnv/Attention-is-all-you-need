@@ -46,7 +46,33 @@ class PositionalEncoding(nn.Module):
         seq_len=x.shape[1]
         # slice the cache upto seq_len and brodcast 
         return x + self.pe_cache[:, :seq_len, :]
+
+class TransformerEmbedding(nn.Module): 
+    """
+    Combines discrete token lookup with continuos positional embedding using embedding lookup table
+    """
+    def __init__(self, vocab_size:int, d_model:int, max_seq_len:int, dropout_rate:float, rngs:nn.Rngs, dtype:jnp.dtype=jnp.bfloat16): 
+        super().__init__() 
+        self.d_model = d_model 
+
+        self.token_embed = nn.Embed(num_embeddings=vocab_size, features=d_model, param_dtype=dtype, dtype=dtype, rngs=rngs) # our lookup table 
+        self.positional_encoding = PositionalEncoding(d_model=d_model, max_len=max_seq_len, dtype=dtype)
+        self.dropout = nn.Dropout(rate=dropout_rate, rngs=rngs) 
     
+    def __call__(self, x: jax.Array, deterministic:bool = False) -> jax.Array:
+        """
+        x : Integer array of shape (batch, seq_len)
+        """
+        # lookup tokens 
+        x_emb = self.token_embed(inputs=x)
+        # scale up token embedding to match variance of pos encodings
+        # without this, pos signal dominates the semantic signal 
+        x_emb = x_emb * jnp.sqrt(jnp.array(self.d_model, dtype=x_emb.dtype)) 
+        # Inject temporal inductive bias of positonal trigonometric waves 
+        x_pe = self.positional_encoding(x_emb) 
+        # Apply stochastic regularisation 
+        return self.dropout(x_pe, deterministic=deterministic)
+
 class MultiHeadSelfAttention(nn.Module):
     """
     RTX 3060 optimised multi-head self attention module.
@@ -195,31 +221,37 @@ class EncoderBlock(nn.Module):
         x = x + ffn_out # residual connection 
         return x 
 
-class TransformerEmbedding(nn.Module): 
+class TransformerEncoder(nn.Module):
     """
-    Combines discrete token lookup with continuos positional embedding using embedding lookup table
+    Complete N layer transformer encoder stack.
+    Maps discrete (B,L) token indices to continuous (B, L, d_model) contextual representations
     """
-    def __init__(self, vocab_size:int, d_model:int, max_seq_len:int, dropout_rate:float, rngs:nn.Rngs, dtype:jnp.dtype=jnp.bfloat16): 
+    def __init__(self, vocab_size:int, d_model:int, n_heads:int, d_ff:int, n_layers:int, max_len:int, dropout_rate:float, rngs:nn.Rngs, type:jnp.dtype=jnp.bfloat16): 
         super().__init__() 
-        self.d_model = d_model 
 
-        self.token_embed = nn.Embed(num_embeddings=vocab_size, features=d_model, param_dtype=dtype, dtype=dtype, rngs=rngs) # our lookup table 
-        self.positional_encoding = PositionalEncoding(d_model=d_model, max_len=max_seq_len, dtype=dtype)
-        self.dropout = nn.Dropout(rate=dropout_rate, rngs=rngs) 
-    
-    def __call__(self, x: jax.Array, deterministic:bool = False) -> jax.Array:
+        # Input Embeddings 
+        self.embedding = TransformerEmbedding(vocab_size=vocab_size, d_model=d_model, max_seq_len=max_len, dropout_rate=dropout_rate, rngs=rngs, dtype=type) 
+
+        # Deep stack of N independent encoder blocks
+        # Using a standard list comprehension cleanly instantiates N distinct parameter states 
+        # XLA will unroll this seamlessly during compilation
+        self.layers = nn.List([EncoderBlock(d_model=d_model, n_heads=n_heads, d_ffn=d_ff, dropout_rate=dropout_rate, rngs=rngs, dtype=type)
+                       for _ in range(n_layers)])
+        # Final Layer Norm Projection 
+        self.final_norm = nn.LayerNorm(num_features=d_model, dtype=type, param_dtype=type, rngs=rngs)
+
+    def __call__(self, x:jax.Array, padding_mask:jax.Array|None=None, deterministic:bool=False) -> jax.Array:
         """
-        x : Integer array of shape (batch, seq_len)
+        x: (batch, seq_length) integer tokens 
+        padding_mask: (Batch, 1, 1, seq_length) shape boolean mask to ignore [PAD] tokens
+        deterministic: bool = True during inference/eval to disable dropouts
         """
-        # lookup tokens 
-        x_emb = self.token_embed(inputs=x)
-        # scale up token embedding to match variance of pos encodings
-        # without this, pos signal dominates the semantic signal 
-        x_emb = x_emb * jnp.sqrt(jnp.array(self.d_model, dtype=x_emb.dtype)) 
-        # Inject temporal inductive bias of positonal trigonometric waves 
-        x_pe = self.positional_encoding(x_emb) 
-        # Apply stochastic regularisation 
-        return self.dropout(x_pe, deterministic=deterministic)
+        # project tokens to continuous space + positional encodings 
+        hidden_states = self.embedding(x, deterministic=deterministic) 
+        # iteratively refine representations through the block sequence 
+        for block in self.layers: hidden_states = block(hidden_states, mask=padding_mask, deterministic=deterministic) 
+        # Final geometry stabilization
+        return self.final_norm(hidden_states)
 
 
 ###########################################################################
@@ -338,8 +370,56 @@ def test_embedding_layer():
     assert output_embeddings.dtype == jnp.bfloat16, "Precision constraint violated"
     print("Embedding projection and symmetry breaking passed.")
 
+def test_transformer_encoder():
+    # Architecture definitions matching the original paper's base model 
+    B:int = 32 
+    L:int = 128 
+    d_model:int = 512 
+    num_heads:int = 8 
+    d_ffn:int = 2048 
+    num_layers:int = 6 # replicating Vaswani et. al 
+    vocab_size:int = 32_000
+
+    rngs = nn.Rngs(params=42, dropout=42) 
+
+    # instantiate the full tower 
+    encoder = TransformerEncoder(vocab_size=vocab_size, d_model=d_model, n_heads=num_heads, d_ff=d_ffn, n_layers=num_layers, max_len=1024, dropout_rate=0.1, rngs=rngs, type=jnp.bfloat16)
+
+    # Generate dummy input tokens (batch=32, seq_len=128) 
+    key = jax.random.PRNGKey(0) 
+    input_ids = jax.random.randint(key, shape=(B, L), minval=0, maxval=vocab_size) 
+    
+    # PADDING MASK 
+    # in our tokeniser 1 is pad token ID 
+    # we create a boolean mask where True means "attend" and False means "ignore" 
+    # shape needs to broadcast over (Batch, NumHeads, SeqLen, SeqLen) in the attention logic
+    pad_id = 1 
+    # Shape: (B, 1, 1, L) 
+    padding_mask = (input_ids != pad_id)[:, jnp.newaxis, jnp.newaxis, :] 
+
+    print("--- Full Transformer Encoder Pass ---")
+    print(f"Discrete Input shape (B, L): {input_ids.shape}")
+    print(f"Padding Mask shape: {padding_mask.shape}")
+    
+    # Execute the deep representation learning
+    encoder_output = encoder(input_ids, padding_mask=padding_mask, deterministic=False)
+    
+    print(f"Contextualized Output shape (B, L, d_model): {encoder_output.shape} | dtype: {encoder_output.dtype}")
+    state = nn.state(encoder, nn.Param) # returns state dict with only Param leaves
+    num_params = sum(leaf.size for leaf in jax.tree_util.tree_leaves(state)) 
+    num_bytes = sum(leaf.nbytes for leaf in jax.tree_util.tree_leaves(state))
+    print(f"\nEncoder :\nTotal trainable parameters: {num_params:,}")
+    print(f"Number of Encoder Layers: {num_layers}")
+    print(f"Memory size ≈ {num_bytes / 1e6:.2f} MiB (float32)")
+    
+    assert encoder_output.shape == (B, L, d_model), "Encoder tower failed to maintain spatial/channel geometry."
+    assert encoder_output.dtype == jnp.bfloat16, "Precision leaked during deep propagation."
+    print("Encoder Tower is structurally flawless.")
+
+
 if __name__ =="__main__":
     prettify = lambda : print("*"*50)
+    print("Testing Embedding Layer"); test_embedding_layer(); prettify()
     print("Testing multi head attention"); test_mha(); prettify()
     print("Testing Encoder Block"); test_encoder_block(); prettify()
-    print("Testing Embedding Layer"); test_embedding_layer(); prettify()
+    print("Testing Full Encoder"); test_transformer_encoder(); prettify()

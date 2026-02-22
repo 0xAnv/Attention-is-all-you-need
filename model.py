@@ -429,7 +429,46 @@ class DecoderBlock(nn.Module):
 
 # here i will implement full decoder (6 stacked blocks)
 class TransformerDecoder(nn.Module):
-    pass 
+    """
+    Complete N Layer transformer decoder stack 
+    Maps discrete (B, L_target) target token indices to continuous (B, L_tar, d_model) contextual representations . (translated sentence in simple words ;)
+    """
+    def __init__(self, vocab_size:int, d_model:int, n_heads:int, d_ffn:int, n_layers:int,max_len:int, dropout:float, rngs:nn.Rngs, dtype:jnp.dtype=jnp.bfloat16):
+        super().__init__() 
+
+        # target input embeddings + pos context 
+        self.embedding = TransformerEmbedding(vocab_size=vocab_size, d_model=d_model, max_seq_len=max_len, dropout_rate=dropout, rngs=rngs, dtype=dtype) 
+
+        # Deep stack of N independent decoder blocks (paper used N=6) 
+        # nn.List natively tracks parameter states across the block sequence 
+        self.layers = nn.List([ 
+            DecoderBlock(d_model=d_model, n_heads=n_heads, d_ffn=d_ffn, rngs=rngs, dropout=dropout, dtype=dtype) 
+            for _ in range(n_layers) 
+        ])
+
+        # FInal geometry stabilisation layer using Norm 
+        self.final_norm = nn.LayerNorm(num_features=d_model, dtype=dtype, param_dtype=dtype, rngs=rngs) 
+
+    def __call__(self, x:jax.Array, encoder_output:jax.Array, target_padding_mask:jax.Array|None=None, source_padding_mask:jax.Array|None=None, deterministic:bool=False) -> jax.Array:
+        """
+        x: (batch, target_seq_len) integer tokens representing right shifted target 
+        encoder_output: (batch, source_seq_len, d_model) output from encoder stack 
+        target_padding_mask: (batch, 1, 1, target_seq_len) causal mask for target sequence 
+        source_padding_mask: (batch, 1, 1, source_seq_len) mask for source sequence 
+        deterministic: bool = True during inference/eval to disable dropouts
+        """
+
+        # Embed discrete tokens in continuos space and apply pos embedding 
+        hidden_states = self.embedding(x, deterministic=deterministic) 
+
+        # padding through N decoder blocks 
+        for block in self.layers:
+            hidden_states = block(x=hidden_states, encoder_output=encoder_output, target_padding_mask=target_padding_mask, source_padding_mask=source_padding_mask, deterministic=deterministic)
+        
+        # final layer norm ouput
+        return self.final_norm(hidden_states) # (batch, target_seq_len, d_model) 
+
+
 
 ###########################################################################
 #                     MODULE TESTING FUNCTIONS
@@ -696,7 +735,7 @@ def test_cross_attention():
     print(f"\nCross-Attention parameters : {num_params:,}")
     print("→ All basic invariants passed.")
 
-def test_decoder_block() -> nn.Module : 
+def test_decoder_block(): 
     # Hyperparameters 
     batch:int = 16 
     target_seq_len:int = 128 
@@ -743,6 +782,67 @@ def test_decoder_block() -> nn.Module :
     print(f"Decoder Block | Total trainable parameters: {num_params:,}") 
     print("-> Decoder block passed dimensional and precision invariants")
 
+def test_transformer_decoder():
+
+    # parameters 
+    vocab_size:int = 32_000 
+    d_model:int = 512 
+    n_heads:int = 8 
+    d_ffn:int = 2048 
+    n_layers:int = 16 
+    dropout:float = 0.1 
+    batch:int = 1024  
+    target_seq_len:int = 128 
+    source_seq_len:int = 128 
+    
+    rngs = nn.Rngs(params=744, dropout=744) 
+
+    # initialize full decoder tower of 6 decoder blocks 
+    decoder = TransformerDecoder(vocab_size=vocab_size, d_model=d_model, n_heads=n_heads, d_ffn=d_ffn, n_layers=n_layers, max_len=target_seq_len,dropout=dropout, rngs=rngs, dtype=jnp.bfloat16)
+
+    # generate dummy target input tokens (batch=16, seq_len = 128 )
+    key = jax.random.PRNGKey(0) 
+    key_tgt, key_enc, key_mask = jax.random.split(key, 3)
+    
+    # dummy target tokens
+    target_ids = jax.random.randint(key_tgt, shape=(batch, target_seq_len), minval=0, maxval=vocab_size, dtype=jnp.int32)
+
+    # generate dummy encoder output (batch=16, seq_len=128, d_model=512)
+    dummy_encoder_out = jax.random.normal(key_enc, shape=(batch, source_seq_len, d_model), dtype=jnp.bfloat16)
+
+    #  generating padding masks 
+    pad_id:int = 1 
+    # target padding mask (b, 1, 1, L_target)
+    target_padding_mask = (target_ids != pad_id)[:, jnp.newaxis, jnp.newaxis, :]
+
+    # source padding mask simulaiting 12% pads in original incoming source tokens 
+    source_padding_mask = jax.random.bernoulli(key_mask, p=1-0.12, shape=(batch, source_seq_len))[:, jnp.newaxis, jnp.newaxis, :] # (batch, 1, 1, target_seq_len)
+
+    print("=== Full Transformer Decodder Pass ===")
+    print(f"Discrete Target Input Shape (B, L_tar) : {target_ids.shape}") 
+    print(f"Encoder OUtput shape (B, L_src, d_model) : {dummy_encoder_out.shape}") 
+    print(f"Target padding mask shape: {target_padding_mask.shape}")
+    print(f"Source padding mask shape: {source_padding_mask.shape}") 
+
+    # propogate the computation through the decoder stack 
+    decoder_output = decoder(x=target_ids, encoder_output=dummy_encoder_out, target_padding_mask=target_padding_mask, source_padding_mask=source_padding_mask, deterministic=False)
+    print(f"Contextualized Decoder Output Shape (B, L_tar, d_model) : {decoder_output.shape} | dtype : {decoder_output.dtype}")
+
+    # getting parameter counts 
+    state = nn.state(decoder, nn.Param)
+    num_params = sum(leaf.size for leaf in jax.tree_util.tree_leaves(state))
+    num_bytes = sum(leaf.nbytes for leaf in jax.tree_util.tree_leaves(state))
+    num_megabytes = num_bytes / 1024 / 1024
+
+    print(f"\nDecoder :\n Total Trainable Parameters: {num_params:,}") 
+    print(f"Number of Decoder Layers: {n_layers}") 
+    print(f"Memory Size (MB): {num_megabytes:.2f}")
+    
+    # assertions and bound checks 
+    assert decoder_output.shape == (batch, target_seq_len, d_model), "Decoder tower failed to maintain exact spatial/channel geometry constraints." 
+    assert decoder_output.dtype == jnp.bfloat16, "Precision unexpectedly leaked during deep propogation through 6 decoder blocks" 
+    print("-> Decoder Tower computations works perfectly finee and flawless.")
+    
 if __name__ =="__main__":
     prettify = lambda : print("*"*50)
     print("Testing Embedding Layer"); test_embedding_layer(); prettify()
@@ -752,3 +852,4 @@ if __name__ =="__main__":
     print("Testing Causal Multi-Head Attention"); test_causal_multihead_attention(); prettify()
     print("Testing Cross-Attention"); test_cross_attention(); prettify()
     print("Testing Decoder Block"); test_decoder_block(); prettify()
+    print("Testing Full Decoder"); test_transformer_decoder(); prettify()

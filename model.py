@@ -640,7 +640,7 @@ def test_transformer_encoder():
     rngs = nn.Rngs(params=42, dropout=42) 
 
     # instantiate the full tower 
-    encoder = TransformerEncoder(vocab_size=vocab_size, d_model=d_model, n_heads=num_heads, d_ff=d_ffn, n_layers=num_layers, max_len=1024, dropout_rate=0.1, rngs=rngs, type=jnp.bfloat16)
+    encoder = TransformerEncoder(vocab_size=vocab_size, d_model=d_model, n_heads=num_heads, d_ff=d_ffn, n_layers=num_layers, max_len=1024, dropout_rate=0.1, rngs=rngs, dtype=jnp.bfloat16)
 
     # Generate dummy input tokens (batch=32, seq_len=128) 
     key = jax.random.PRNGKey(0) 

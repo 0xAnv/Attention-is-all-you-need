@@ -8,8 +8,13 @@ dependencies = [
     "datasets>=4.5.0",
     "flax>=0.12.4",
     "jax[cuda13]>=0.9.0.1",
+    "optax>=0.2.6",
+    "orbax-checkpoint>=0.11.33",
     "pandas>=3.0.1",
+    "pyyaml>=6.0.3",
+    "sacrebleu>=2.6.0",
     "tokenizers>=0.22.2",
+    "wandb>=0.25.0",
 ]
 
 [dependency-groups]

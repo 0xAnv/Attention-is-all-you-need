@@ -227,8 +227,6 @@ class CausalMultiHeadAttention(nn.Module):
         # use mha to pass in mask as a parameter 
         return self.mha(x=x, mask=combined_mask, deterministic=deterministic) 
 
-
-
 class CrossAttention(nn.Module):
     """
     Cross-attention module for the Transformer decoder.
@@ -366,9 +364,72 @@ class TransformerEncoder(nn.Module):
         # Final geometry stabilization
         return self.final_norm(hidden_states)
 
+class DecoderBlock(nn.Module): 
+    """
+    Single Block of transformer decoder. Final block will have 6 of these stacked.
 
+    Features (implemented from attention is all you need paper):
+        1. Masked Multi Head Attention: Attend to previous tokens in target sequence (prevents look ahead) 
+        2. Cross Attention: Attends to the encoder's output to mix with decoder 
+        3. Feed Forward Network: Expands and contracts dimensions for non-;linear feature transformations  
+    
+    NOTE: we used pre-layer norm in this implementation (as opposed to post-layer norm in the original paper). This is known to be stable for training deep transformers than post-layer norm.
+    """
+    def __init__(self, d_model:int, n_heads:int, d_ffn:int, rngs:nn.Rngs,dropout:float=0.1, dtype:jnp.dtype=jnp.bfloat16):
+        super().__init__() 
+        # SUBLAYER 1: Masked Multi Head Self Attention (causal mask)
+        self.masked_mha = CausalMultiHeadAttention(d_model=d_model, num_heads=n_heads, rngs=rngs, dropout_rate=dropout, dtype=dtype) 
+        self.ln1 = nn.LayerNorm(num_features=d_model, dtype=dtype, param_dtype=dtype, rngs=rngs) 
+        self.dropout1 = nn.Dropout(rate=dropout, rngs=rngs) 
 
-        
+        # SUBLAYER 2: Cross Attention (Decoder-Encoder attention) 
+        self.cross_mha = CrossAttention(d_model=d_model, num_heads = n_heads, rngs=rngs, dropout_rate=dropout, dtype=dtype) 
+        self.ln2 = nn.LayerNorm(num_features=d_model, dtype=dtype, param_dtype=dtype, rngs=rngs)
+        self.dropout2 = nn.Dropout(rate=dropout, rngs=rngs) 
+
+        # SUBLAYER 3: Position wise feed forward network 
+        self.ffn = PositionWiseFFN(d_model=d_model, d_ffn=d_ffn, rngs=rngs, dtype=dtype)
+        self.ln3 = nn.LayerNorm(num_features=d_model, dtype=dtype, param_dtype=dtype, rngs=rngs)
+        self.dropout3 = nn.Dropout(rate=dropout, rngs=rngs) 
+
+    def __call__(self, x:jax.Array, encoder_output:jax.Array, target_padding_mask:jax.Array|None=None, source_padding_mask:jax.Array|None=None, deterministic:bool=False) -> jax.Array:
+        """
+        Args: 
+            x: target seq embeddings/prev layer output (batch, target_seq_len, d_model) 
+            encoder_output: Encoder stack final context (batch, source_seq_len, d_model) 
+            target_padding_mask: Mask for target sequence (batch, 1, 1, target_seq_len) 
+            source_padding_mask: Mask for source sequence (used in cross attention ) (batch, 1, 1, source_seq_len) 
+            deterministic: bool = True during inference/eval to disable dropouts
+        """ 
+
+        # SUBLAYER 1: Masked multi head self attention
+        # purpose: allow the decoder to look at previous words in target sequence it has generated 
+        norm_x = self.ln1(x) # norm is applied to inputs so this is pre-layer norm
+        attn_out = self.masked_mha(x=norm_x, padding_mask=target_padding_mask, deterministic=deterministic) 
+        attn_out = self.dropout1(attn_out, deterministic=deterministic) 
+        x = x + attn_out # residual connection
+
+        # SUBLAYER 2: Cross Atention Forward pass 
+        # purpose: allow the decoder to focus on relevant parts of the encoder output 
+        # Q comes from decoder layer or embedding layer 
+        # k,v comes from the encoder outpt 
+        normx = self.ln2(x) 
+        # in cross attn , x is query vector, enc o/p is key and value 
+        attn_out = self.cross_mha(x=norm_x, context=encoder_output, mask=source_padding_mask, deterministic=deterministic)
+        attn_out = self.dropout2(attn_out, deterministic=deterministic)
+        x = x + attn_out # residual connection
+
+        # SUBLAYER 3: position wise feed forward layer 
+        # purpose: apply additional non-linear transformations to every position independently, also increase dimensionality and reduce it 
+        normx = self.ln3(x) 
+        ffn_out = self.ffn(normx) 
+        ffn_out = self.dropout3(ffn_out, deterministic=deterministic) 
+        x = x + ffn_out # reidual connection of final sublayer 
+        return x # shape: (batch, target_seq_len, d_model) 
+
+# here i will implement full decoder (6 stacked blocks)
+class TransformerDecoder(nn.Module):
+    pass 
 
 ###########################################################################
 #                     MODULE TESTING FUNCTIONS
@@ -635,6 +696,53 @@ def test_cross_attention():
     print(f"\nCross-Attention parameters : {num_params:,}")
     print("→ All basic invariants passed.")
 
+def test_decoder_block() -> nn.Module : 
+    # Hyperparameters 
+    batch:int = 16 
+    target_seq_len:int = 128 
+    source_seq_len:int = 128
+    d_model:int = 512 
+    n_heads:int = 8 
+    d_ffn:int = 2048 
+    dropout:float = 0.1 
+    rngs = nn.Rngs(params=744, dropout=744)
+    
+    decoder_block = DecoderBlock(d_model=d_model, n_heads=n_heads, d_ffn=d_ffn, rngs=rngs, dropout=dropout, dtype=jnp.bfloat16)
+    
+    key = jax.random.PRNGKey(0)
+    key1, key2, key3, key4 = jax.random.split(key, 4)
+
+    # dummy data 
+    dummy_target_seq = jax.random.uniform(key1, (batch, target_seq_len, d_model), dtype=jnp.bfloat16) 
+    dummy_encoder_out = jax.random.uniform(key2, (batch, target_seq_len, d_model) , dtype=jnp.bfloat16)  
+
+    # simulate padding masks 
+    target_padding_frac:float=0.25
+    encoder_padding_frac:float=0.25 
+
+    target_padding_mask = jax.random.bernoulli(key3, p = 1.0 - target_padding_frac, shape=(batch, target_seq_len))[:, None, None, :] 
+    encoder_padding_mask = jax.random.bernoulli(key4, p = 1.0-encoder_padding_frac, shape=(batch, source_seq_len))[:, None, None, :] 
+
+    print("=== Decoder Block Forward Pass ===")
+    print(f"Target Input shape (B, L_tar, d_model): {dummy_target_seq.shape} | dtype : {dummy_target_seq.dtype}") 
+    print(f"Encoder Output shape (B, L_src, d_model) : {dummy_encoder_out.shape}") 
+    print(f"Target padding mask shape: {target_padding_mask.shape}")
+    print(f"Source padding mask shape: {encoder_padding_mask.shape}")
+
+    # execute forward pass 
+    output_train = decoder_block(x=dummy_target_seq, encoder_output=dummy_encoder_out, target_padding_mask=target_padding_mask, source_padding_mask=encoder_padding_mask, deterministic=False)
+    print(f"\nOutput Shape (B, L_tar, d_model): {output_train.shape} | dtype: {output_train.dtype}")
+
+    # run assertions for testing 
+    assert output_train.shape == dummy_target_seq.shape, "Output geometry must match input target geometry" 
+    assert output_train.dtype == jnp.bfloat16, "Precision leaked during compute" 
+
+    # Parameter count 
+    state = nn.state(decoder_block, nn.Param) 
+    num_params = sum(leaf.size for leaf in jax.tree_util.tree_leaves(state)) 
+    print(f"Decoder Block | Total trainable parameters: {num_params:,}") 
+    print("-> Decoder block passed dimensional and precision invariants")
+
 if __name__ =="__main__":
     prettify = lambda : print("*"*50)
     print("Testing Embedding Layer"); test_embedding_layer(); prettify()
@@ -643,3 +751,4 @@ if __name__ =="__main__":
     print("Testing Full Encoder"); test_transformer_encoder(); prettify()
     print("Testing Causal Multi-Head Attention"); test_causal_multihead_attention(); prettify()
     print("Testing Cross-Attention"); test_cross_attention(); prettify()
+    print("Testing Decoder Block"); test_decoder_block(); prettify()

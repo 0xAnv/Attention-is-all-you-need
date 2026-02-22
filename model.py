@@ -981,18 +981,18 @@ def TEST_TRANSFORMER():
 
 def test_all_block_sequentially():
     prettify = lambda : print("*"*50)
-    # print("Testing Embedding Layer"); test_embedding_layer(); prettify()
-    # print("Testing multi head attention"); test_mha(); prettify()
-    # print("Testing Causal Multi-Head Attention"); test_causal_multihead_attention(); prettify()
-    # print("Testing Cross-Attention"); test_cross_attention(); prettify()
+    print("Testing Embedding Layer"); test_embedding_layer(); prettify()
+    print("Testing multi head attention"); test_mha(); prettify()
+    print("Testing Causal Multi-Head Attention"); test_causal_multihead_attention(); prettify()
+    print("Testing Cross-Attention"); test_cross_attention(); prettify()
     
-    # # Encoder testing code 
-    # print("Testing Encoder Block"); test_encoder_block(); prettify()
-    # print("Testing Full Encoder"); test_transformer_encoder(); prettify()
+    # Encoder testing code 
+    print("Testing Encoder Block"); test_encoder_block(); prettify()
+    print("Testing Full Encoder"); test_transformer_encoder(); prettify()
 
-    # # Decoder testing code
-    # print("Testing Decoder Block"); test_decoder_block(); prettify()
-    # print("Testing Full Decoder"); test_transformer_decoder(); prettify()
+    # Decoder testing code
+    print("Testing Decoder Block"); test_decoder_block(); prettify()
+    print("Testing Full Decoder"); test_transformer_decoder(); prettify()
 
     # Final transformer testing code
     print("Testing Full Transformer"); TEST_TRANSFORMER(); prettify()

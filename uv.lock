@@ -838,8 +838,8 @@ wheels = [
 
 [package.optional-dependencies]
 cuda13 = [
-    { name = "jax-cuda13-plugin", extra = ["with-cuda"], marker = "sys_platform == 'linux'" },
-    { name = "jaxlib", marker = "sys_platform == 'linux'" },
+    { name = "jax-cuda13-plugin", extra = ["with-cuda"] },
+    { name = "jaxlib" },
 ]
 
 [[package]]
@@ -856,7 +856,7 @@ name = "jax-cuda13-plugin"
 version = "0.9.0.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "jax-cuda13-pjrt", marker = "sys_platform == 'linux'" },
+    { name = "jax-cuda13-pjrt" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/3f/e6/366941378eb80c28b0727e5aa574b50bcaa90b9a20b1d066b3b64b0e06cc/jax_cuda13_plugin-0.9.0.1-cp312-cp312-manylinux_2_27_aarch64.whl", hash = "sha256:994642ece229f07e185cee1ce11ef5bfd1818338177a533e0e3fa61ee022e8db", size = 5621127, upload-time = "2026-02-05T18:46:04.846Z" },
@@ -885,7 +885,7 @@ with-cuda = [
     { name = "nvidia-nccl-cu13", marker = "sys_platform == 'linux'" },
     { name = "nvidia-nvjitlink", marker = "sys_platform == 'linux'" },
     { name = "nvidia-nvshmem-cu13", marker = "sys_platform == 'linux'" },
-    { name = "nvidia-nvvm", marker = "sys_platform == 'linux'" },
+    { name = "nvidia-nvvm" },
 ]
 
 [[package]]
@@ -1537,6 +1537,7 @@ source = { registry = "https://pypi.org/simple" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/3d/24/8ce3e8564e1ebf468b2b9a838f2a6c8f357ad63bec353a6a5c38b3f79250/nvidia_nvvm-13.1.115-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl", hash = "sha256:6fdf483d85d9903f9cbf84c41d99221a86e0c0511d05de3d237b4ab69c11627e", size = 63386729, upload-time = "2026-01-13T22:51:00.152Z" },
     { url = "https://files.pythonhosted.org/packages/e6/01/7dc8dc16b86dd173dc786f454eff688efa4fd61e9eff5f582aad90621e4c/nvidia_nvvm-13.1.115-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:860706eb4b5851ac1d2bacf574b582ec66901acc31051da9b0cf9a2c910a9aa9", size = 61001803, upload-time = "2026-01-13T22:50:40.768Z" },
+    { url = "https://files.pythonhosted.org/packages/bc/53/dc1cc7970beb56ec6ce3717fd110b04f57ee338556d3e06114a0bfbc267d/nvidia_nvvm-13.1.115-py3-none-win_amd64.whl", hash = "sha256:795c08d8a9d2f184dbd6ffcf049ce2ede5af1b77e7965e7936ef73125e7bee21", size = 55415346, upload-time = "2026-01-13T23:03:18.422Z" },
 ]
 
 [[package]]
@@ -2538,9 +2539,7 @@ source = { virtual = "." }
 dependencies = [
     { name = "datasets" },
     { name = "flax" },
-    { name = "jax", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
-    { name = "jax", marker = "sys_platform == 'darwin'" },
-    { name = "jax", extra = ["cuda13"], marker = "sys_platform == 'linux'" },
+    { name = "jax", extra = ["cuda13"] },
     { name = "optax" },
     { name = "orbax-checkpoint" },
     { name = "pandas" },
@@ -2560,8 +2559,7 @@ dev = [
 requires-dist = [
     { name = "datasets", specifier = ">=4.5.0" },
     { name = "flax", specifier = ">=0.12.4" },
-    { name = "jax", extras = ["cpu"], marker = "sys_platform == 'darwin'", specifier = ">=0.9.0.1" },
-    { name = "jax", extras = ["cuda13"], marker = "sys_platform == 'linux'", specifier = ">=0.9.0.1" },
+    { name = "jax", extras = ["cuda13"], specifier = ">=0.9.0.1" },
     { name = "optax", specifier = ">=0.2.6" },
     { name = "orbax-checkpoint", specifier = ">=0.11.33" },
     { name = "pandas", specifier = ">=3.0.1" },

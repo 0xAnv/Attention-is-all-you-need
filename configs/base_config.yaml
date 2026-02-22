@@ -1,0 +1,19 @@
+# Model Architecture
+d_model: 512
+num_heads: 8
+num_layers: 6
+d_ff: 2048
+dropout_rate: 0.1
+
+# Training
+batch_size: 32
+learning_rate: 0.0001
+warmup_steps: 4000
+num_epochs: 10
+
+# Data
+max_seq_len: 256
+vocab_size: 37000 # Approximate vocabulary size for translation task
+
+# System
+seed: 42

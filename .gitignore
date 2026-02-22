@@ -16,3 +16,4 @@ filtered_data/
 processed_data/
 
 notes/
+wandb/

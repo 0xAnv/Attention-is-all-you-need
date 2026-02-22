@@ -85,6 +85,7 @@ class MultiHeadSelfAttention(nn.Module):
                  d_model:int, 
                  num_heads:int, 
                  rngs:nn.Rngs, 
+                 dropout_rate:float=0.0,
                  dtype:jnp.dtype=jnp.bfloat16 ):
         super().__init__()
         # ensure tensor dimensions align properly 
@@ -121,13 +122,15 @@ class MultiHeadSelfAttention(nn.Module):
             param_dtype=self.dtype,
             rngs=rngs
         )
+        self.dropout = nn.Dropout(rate=dropout_rate, rngs=rngs)
 
     # forward pass for multi-head self attention
-    def __call__(self, x:jax.Array, mask:jax.Array|None=None) -> jax.Array:
+    def __call__(self, x:jax.Array, mask:jax.Array|None=None, deterministic:bool=False) -> jax.Array:
         """
         x: Input tensor of shape (batch_size, seq_length, d_model)
         mask: Optional boolean mask of shape (batch_size, 1, seq_length, seq_length) 
               for masking out padding tokens or future tokens in decoder
+        deterministic: If True, disable dropout
         """
         B, L, D = x.shape
         assert D == self.d_model, f"Input feature dimension ({D}) must match model dimension ({self.d_model})"
@@ -159,6 +162,9 @@ class MultiHeadSelfAttention(nn.Module):
         # for numerical stability we cast to fp32 for softmax 
         # then back to bfloat16 
         attention_weights = jax.nn.softmax(logits.astype(jnp.float32), axis=-1).astype(self.dtype)
+        
+        # Apply stochastic dropout on attention weights
+        attention_weights = self.dropout(attention_weights, deterministic=deterministic)
 
         # multiplying attention weights to V 
         # v : (B, num_heads, L, d_k) 
@@ -171,6 +177,113 @@ class MultiHeadSelfAttention(nn.Module):
 
         # final linear projections to get maximum context
         return self.out_proj(context)
+
+class CausalMultiHeadAttention(nn.Module): 
+    """ 
+    Multi-head causal self attention used in the decoder
+    This forces autoregressive (left-to-right) generation by masking future positions. 
+
+    Compared to encoder attention:
+    - Always applies a causal (lower-triangular mask)
+    - Usually called with same sequence as Q=K=V (self-attention)
+    """
+
+    def __init__(self, d_model:int, num_heads:int, rngs:nn.Rngs, dropout_rate:float=0.0, dtype: jnp.dtype= jnp.bfloat16):
+        super().__init__()
+
+        self.mha = MultiHeadSelfAttention(d_model=d_model, num_heads=num_heads, rngs=rngs, dropout_rate=dropout_rate, dtype=dtype)
+        self.num_heads=num_heads
+        self.dtype=dtype
+
+    def __call__(self, x: jax.Array, padding_mask:jax.Array|None=None, deterministic:bool=False) -> jax.Array:
+        """ 
+        Args:
+            x : Query, key and value all come from the same tensor of shape(batch, target_seq_len, d_model) 
+            padding_mask: Optinal padding mask (usually from target side) of shape(batch, 1, 1, target_seq_len) - true = attend 
+            deterministic: If True, disable dropout
+
+        Returns: 
+            Output of shape (batch, target_seq_Len, d_model)
+        """
+
+        B, L_dec, d_model = x.shape
+        causal_mask = jnp.tril(jnp.ones((L_dec, L_dec), dtype=jnp.bool_))
+
+        # reshape for broadcast -> (1, 1, L_dec, L_dec)
+        causal_mask = causal_mask[None, None, :, :] # this adds two extra dims 
+
+        # combine padding mask and causal mask 
+        if padding_mask is not None:
+            # padding mask : (B, 1, 1 , L_dec) 
+            # causal mask : (1, 1, L_dec, L_dec) 
+            # combined shape : (B, 1, L_dec, L_dec) 
+
+            # True -> can attend 
+            # False -> Cannot attend 
+            combined_mask = padding_mask & causal_mask # logical AND operation 
+
+        else: combined_mask = causal_mask 
+
+        # use mha to pass in mask as a parameter 
+        return self.mha(x=x, mask=combined_mask, deterministic=deterministic) 
+
+
+
+class CrossAttention(nn.Module):
+    """
+    Cross-attention module for the Transformer decoder.
+    Allows the decoder to attend to the encoder's output for alignment.
+    """
+    def __init__(self, d_model:int, num_heads:int, rngs:nn.Rngs, dropout_rate:float=0.0, dtype:jnp.dtype=jnp.bfloat16):
+        super().__init__()
+        if d_model % num_heads != 0: raise ValueError(f"d_model ({d_model}) must be divisible by num_heads ({num_heads})")
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+        self.dtype = dtype
+        self.scale = jax.lax.rsqrt(jnp.array(self.d_k, dtype=self.dtype))
+
+        # Separate projections for Queries (Decoder) and Keys/Values (Encoder)
+        self.q_proj = nn.Linear(in_features=self.d_model, out_features=self.d_model, use_bias=False, dtype=self.dtype, param_dtype=self.dtype, rngs=rngs)
+        self.kv_proj = nn.Linear(in_features=self.d_model, out_features=2 * self.d_model, use_bias=False, dtype=self.dtype, param_dtype=self.dtype, rngs=rngs)
+        self.out_proj = nn.Linear(in_features=self.d_model, out_features=self.d_model, use_bias=False, dtype=self.dtype, param_dtype=self.dtype, rngs=rngs)
+        self.dropout = nn.Dropout(rate=dropout_rate, rngs=rngs)
+
+    def __call__(self, x:jax.Array, context:jax.Array, mask:jax.Array|None=None, deterministic:bool=False) -> jax.Array:
+        """
+        x: Decoder queries, shape (B, target_seq_len, d_model)
+        context: Encoder output, shape (B, source_seq_len, d_model)
+        mask: Optional padding mask from encoder, shape (B, 1, 1, source_seq_len)
+        """
+        B, L_q, _ = x.shape
+        _, L_kv, _ = context.shape
+
+        q = self.q_proj(x) # (B, L_q, d_model)
+        kv = self.kv_proj(context) # (B, L_kv, 2 * d_model)
+
+        q = q.reshape(B, L_q, self.num_heads, self.d_k)
+        kv = kv.reshape(B, L_kv, 2, self.num_heads, self.d_k)
+
+        # transpose: (B, num_heads, L_q, d_k)
+        q = jnp.transpose(q, (0, 2, 1, 3))
+        # isolate k, v, transpose: (B, num_heads, L_kv, d_k)
+        kv = jnp.transpose(kv, (2, 0, 3, 1, 4))
+        k, v = kv[0], kv[1]
+
+        # Scaled dot product attention
+        logits = jnp.einsum('bhqd, bhkd -> bhqk', q, k) * self.scale
+
+        if mask is not None:
+            neg_inf = jnp.array(-1e9, dtype=logits.dtype)
+            logits = jnp.where(mask, logits, neg_inf)
+        
+        attention_weights = jax.nn.softmax(logits.astype(jnp.float32), axis=-1).astype(self.dtype)
+        attention_weights = self.dropout(attention_weights, deterministic=deterministic)
+
+        out = jnp.einsum('bhqk, bhkd -> bhqd', attention_weights, v)
+        out = jnp.transpose(out, (0, 2, 1, 3)).reshape(B, L_q, self.d_model)
+
+        return self.out_proj(out)
 
 class PositionWiseFFN(nn.Module): 
     """
@@ -198,7 +311,7 @@ class EncoderBlock(nn.Module):
     """
     def __init__(self, d_model:int, n_heads:int, d_ffn:int, dropout_rate:float, rngs:nn.Rngs, dtype:jnp.dtype=jnp.bfloat16) -> None:
         super().__init__()
-        self.mha = MultiHeadSelfAttention(d_model=d_model, num_heads=n_heads, rngs=rngs, dtype=dtype) 
+        self.mha = MultiHeadSelfAttention(d_model=d_model, num_heads=n_heads, rngs=rngs, dropout_rate=dropout_rate, dtype=dtype) 
         self.ffn = PositionWiseFFN(d_model=d_model, d_ffn=d_ffn, rngs=rngs, dtype=dtype)
 
         # pre Layer-Norm : Norms are applied BEFORE the sublayers
@@ -213,7 +326,7 @@ class EncoderBlock(nn.Module):
     def __call__(self, x:jax.Array, mask:jax.Array|None=None, deterministic:bool=False) -> jax.Array:
         """ Put deterministic=True during eval/val/inference to disable dropout """
         # sublayer 1: Multi Head Self Attention (pre-LN and residual connection) 
-        norm_x = self.ln1(x); attn_out = self.mha(norm_x, mask=mask); attn_out = self.dropout1(attn_out, deterministic=deterministic)
+        norm_x = self.ln1(x); attn_out = self.mha(norm_x, mask=mask, deterministic=deterministic); attn_out = self.dropout1(attn_out, deterministic=deterministic)
         x = x + attn_out # residual connection
 
         # sublayer 2: Positional wise feed forward network 
@@ -253,6 +366,9 @@ class TransformerEncoder(nn.Module):
         # Final geometry stabilization
         return self.final_norm(hidden_states)
 
+
+
+        
 
 ###########################################################################
 #                     MODULE TESTING FUNCTIONS
@@ -372,12 +488,12 @@ def test_embedding_layer():
 
 def test_transformer_encoder():
     # Architecture definitions matching the original paper's base model 
-    B:int = 32 
-    L:int = 128 
+    B:int = 1024
+    L:int = 128
     d_model:int = 512 
-    num_heads:int = 8 
+    num_heads:int = 8
     d_ffn:int = 2048 
-    num_layers:int = 6 # replicating Vaswani et. al 
+    num_layers:int = 16 # replicating Vaswani et. al 
     vocab_size:int = 32_000
 
     rngs = nn.Rngs(params=42, dropout=42) 
@@ -416,6 +532,108 @@ def test_transformer_encoder():
     assert encoder_output.dtype == jnp.bfloat16, "Precision leaked during deep propagation."
     print("Encoder Tower is structurally flawless.")
 
+# function to test causal multihead attention mechanism 
+def test_causal_multihead_attention(): 
+    """ 
+    Small standalone function which tests causal multi head attention 
+    used in decoder block of the transformer model. 
+    This testing func, checks dtype consistencies, device placement and basic masking behavior
+    """
+    # hyperparameters 
+    B:int = 16 # batch size for parallel comp
+    L:int = 128  # max_seq_len (decoder) in our case same as encoder
+    d_model:int = 512 # replicating attention paper 
+    num_heads:int = 8 # from paper 
+    dropout_rate:float = 0.1 
+
+    rngs=nn.Rngs(params=744, dropout=744) 
+
+    causal_mha = CausalMultiHeadAttention(d_model=d_model, num_heads=num_heads, rngs=rngs, dropout_rate=dropout_rate, dtype=jnp.bfloat16) 
+
+    # creating dummy input to simulate encoder output (input for decoder) 
+    key = jax.random.PRNGKey(744) 
+    dummy_x = jax.random.normal(key, shape=(B, L, d_model), dtype=jnp.bfloat16) 
+    
+    # padding mask here 
+    pad_tok_fraction:float = 0.15 # 15% tokens 
+    padding_mask = jax.random.bernoulli(key, p=1.0-pad_tok_fraction, shape=(B,L))[:, None, None, :] # (B, 1, 1, L) -> True = attend
+
+    print("=== Causal Multi-Head Attention Test ===")
+    print(f"Input shape              : {dummy_x.shape} | dtype: {dummy_x.dtype}")
+    print(f"Padding mask shape       : {padding_mask.shape}")
+    print(f"Model dtype              : {causal_mha.mha.dtype}")
+    print(f"Number of heads          : {num_heads}")
+    print(f"d_k (head dimension)     : {d_model // num_heads}")
+
+    #forward pass (dropout active ) 
+    output_train = causal_mha(dummy_x, padding_mask=padding_mask, deterministic=False) 
+
+    # forward pass - inference mode (dropout off ) 
+    output_infer = causal_mha(dummy_x, padding_mask=padding_mask, deterministic=True) 
+
+    # ─── Basic shape and type checks ──────────────────────────────────────────
+    print("\nResults:")
+    print(f"Output shape (train)     : {output_train.shape} | dtype: {output_train.dtype}")
+    print(f"Output shape (infer)     : {output_infer.shape} | dtype: {output_infer.dtype}")
+
+    assert output_train.shape == (B, L, d_model), "Shape mismatch in training mode"
+    assert output_infer.shape == (B, L, d_model), "Shape mismatch in inference mode"
+    assert output_train.dtype == jnp.bfloat16, "Dtype leak in training mode"
+    assert output_infer.dtype == jnp.bfloat16, "Dtype leak in inference mode"
+
+    # ─── Very basic correctness check: outputs should be different due to dropout ─
+    diff_norm = jnp.mean(jnp.abs(output_train - output_infer))
+    print(f"Mean absolute difference (train vs infer): {float(diff_norm):.6f}")
+    print("(should be > 0 because dropout is active in train mode)")
+
+    # ─── Count parameters ----
+    state = nn.state(causal_mha, nn.Param)
+    num_params = sum(leaf.size for leaf in jax.tree_util.tree_leaves(state))
+    num_bytes  = sum(leaf.nbytes for leaf in jax.tree_util.tree_leaves(state))
+
+    print(f"\nCausal MHA module parameters : {num_params:,}")
+    print(f"Approx memory (bf16)         : {num_bytes / 1e6:.2f} MiB")
+
+    print("\n→ All basic invariants passed.")
+    print("   (shape, dtype, dropout behavior, parameter count)")
+
+def test_cross_attention():
+    B:int = 16
+    L_q:int = 64 # target seq len
+    L_kv:int = 128 # source seq len
+    d_model:int = 512
+    num_heads:int = 8
+    dropout_rate:float = 0.1
+
+    rngs = nn.Rngs(params=744, dropout=744)
+    cross_attn = CrossAttention(d_model=d_model, num_heads=num_heads, rngs=rngs, dropout_rate=dropout_rate, dtype=jnp.bfloat16)
+
+    key = jax.random.PRNGKey(744)
+    dummy_q = jax.random.normal(key, shape=(B, L_q, d_model), dtype=jnp.bfloat16)
+    dummy_kv = jax.random.normal(key, shape=(B, L_kv, d_model), dtype=jnp.bfloat16)
+
+    pad_tok_fraction:float = 0.15
+    padding_mask = jax.random.bernoulli(key, p=1.0-pad_tok_fraction, shape=(B, L_kv))[:, None, None, :]
+
+    print("=== Cross-Attention Test ===")
+    print(f"Decoder Search Shape (Q) : {dummy_q.shape}")
+    print(f"Encoder Context Shape (KV) : {dummy_kv.shape}")
+    print(f"Padding Mask shape       : {padding_mask.shape}")
+
+    output_train = cross_attn(dummy_q, dummy_kv, mask=padding_mask, deterministic=False)
+    output_infer = cross_attn(dummy_q, dummy_kv, mask=padding_mask, deterministic=True)
+
+    print("\nResults:")
+    print(f"Output shape (train)     : {output_train.shape} | dtype: {output_train.dtype}")
+    print(f"Output shape (infer)     : {output_infer.shape} | dtype: {output_infer.dtype}")
+
+    assert output_train.shape == (B, L_q, d_model), "Shape mismatch in training mode"
+    assert output_infer.shape == (B, L_q, d_model), "Shape mismatch in inference mode"
+
+    state = nn.state(cross_attn, nn.Param)
+    num_params = sum(leaf.size for leaf in jax.tree_util.tree_leaves(state))
+    print(f"\nCross-Attention parameters : {num_params:,}")
+    print("→ All basic invariants passed.")
 
 if __name__ =="__main__":
     prettify = lambda : print("*"*50)
@@ -423,3 +641,5 @@ if __name__ =="__main__":
     print("Testing multi head attention"); test_mha(); prettify()
     print("Testing Encoder Block"); test_encoder_block(); prettify()
     print("Testing Full Encoder"); test_transformer_encoder(); prettify()
+    print("Testing Causal Multi-Head Attention"); test_causal_multihead_attention(); prettify()
+    print("Testing Cross-Attention"); test_cross_attention(); prettify()

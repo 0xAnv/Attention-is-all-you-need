@@ -337,19 +337,19 @@ class TransformerEncoder(nn.Module):
     Complete N layer transformer encoder stack.
     Maps discrete (B,L) token indices to continuous (B, L, d_model) contextual representations
     """
-    def __init__(self, vocab_size:int, d_model:int, n_heads:int, d_ff:int, n_layers:int, max_len:int, dropout_rate:float, rngs:nn.Rngs, type:jnp.dtype=jnp.bfloat16): 
+    def __init__(self, vocab_size:int, d_model:int, n_heads:int, d_ff:int, n_layers:int, max_len:int, dropout_rate:float, rngs:nn.Rngs, dtype:jnp.dtype=jnp.bfloat16): 
         super().__init__() 
 
         # Input Embeddings 
-        self.embedding = TransformerEmbedding(vocab_size=vocab_size, d_model=d_model, max_seq_len=max_len, dropout_rate=dropout_rate, rngs=rngs, dtype=type) 
+        self.embedding = TransformerEmbedding(vocab_size=vocab_size, d_model=d_model, max_seq_len=max_len, dropout_rate=dropout_rate, rngs=rngs, dtype=dtype) 
 
         # Deep stack of N independent encoder blocks
         # Using a standard list comprehension cleanly instantiates N distinct parameter states 
         # XLA will unroll this seamlessly during compilation
-        self.layers = nn.List([EncoderBlock(d_model=d_model, n_heads=n_heads, d_ffn=d_ff, dropout_rate=dropout_rate, rngs=rngs, dtype=type)
+        self.layers = nn.List([EncoderBlock(d_model=d_model, n_heads=n_heads, d_ffn=d_ff, dropout_rate=dropout_rate, rngs=rngs, dtype=dtype)
                        for _ in range(n_layers)])
         # Final Layer Norm Projection 
-        self.final_norm = nn.LayerNorm(num_features=d_model, dtype=type, param_dtype=type, rngs=rngs)
+        self.final_norm = nn.LayerNorm(num_features=d_model, dtype=dtype, param_dtype=dtype, rngs=rngs)
 
     def __call__(self, x:jax.Array, padding_mask:jax.Array|None=None, deterministic:bool=False) -> jax.Array:
         """
@@ -468,6 +468,47 @@ class TransformerDecoder(nn.Module):
         # final layer norm ouput
         return self.final_norm(hidden_states) # (batch, target_seq_len, d_model) 
 
+class Transformer(nn.Module): 
+    """
+    Complete Sequence to Sequence Transformer Architecture (Attention is all you need paper) 
+    Combined the Encoder and Decoder stack with final vocabulary projection layer 
+    """
+    def __init__(self, vocab_size:int, d_model:int, n_heads:int, d_ff:int, enc_n_layers:int, dec_n_layers:int, enc_max_len:int,dec_max_len:int, enc_dropout:float, dec_dropout:float, rngs:nn.Rngs, dtype:jnp.dtype=jnp.bfloat16) :
+        super().__init__() 
+
+        # ENCODER STACK 
+        self.encoder = TransformerEncoder(vocab_size=vocab_size, d_model=d_model, n_heads=n_heads, d_ff=d_ff, n_layers=enc_n_layers, max_len=enc_max_len, dropout_rate=enc_dropout, rngs=rngs, dtype=dtype)
+
+        # DECODER STACK 
+        self.decoder = TransformerDecoder(vocab_size=vocab_size, d_model=d_model, n_heads=n_heads, d_ffn=d_ff, n_layers=dec_n_layers, max_len=dec_max_len, dropout=dec_dropout, rngs=rngs, dtype=dtype)
+
+        # final generator linear layer 
+        self.generator = nn.Linear(in_features=d_model, out_features=vocab_size, use_bias=False, dtype=dtype, param_dtype=dtype, rngs=rngs) 
+
+    def __call__(self, source:jax.Array, target:jax.Array, source_padding_mask:jax.Array|None=None, target_padding_mask:jax.Array|None=None, deterministic:bool=False) -> jax.Array: 
+        """
+        Finally! Forward pass for the full transformer model. 
+        
+        Args: 
+            source: (batch, source_seq_len) integer tokens representing source sequence 
+            target: (batch, target_seq_len) integer tokens representing target sequence        
+            source_padding_mask: (batch, 1, 1, source_seq_len), boolean mask. True=attend, False=ignore pad 
+            target_padding_mask: (batch, 1, 1, target_seq_len), boolean mask . 
+            deterministic: bool = True , during inference/eval to skip stochastics (dropouts)    
+
+        Returns: 
+            logits: (batch, target_seq_len, vocab_size)
+            UnNormalized log probabilities over the vocabulary
+        """
+        # Encode the source sequence (batch, source_seq_len) -> (batch, source_seq_len, d_model) 
+        encoded_output = self.encoder(x=source, padding_mask=source_padding_mask, deterministic=deterministic) 
+
+        # Decode using target and encoder context: (batch. target_seq_len) + (batch, source_seq_len, d_model) -> (batch, target_seq_len, d_model) 
+        decoded_output = self.decoder(x=target, encoder_output=encoded_output, target_padding_mask=target_padding_mask, source_padding_mask=source_padding_mask, deterministic=deterministic)
+
+        # Final linear projection to project to vocabulary space: (batch, target_seq_len, d_model) -> (batch, target_seq_len, vocab_size) 
+        logits = self.generator(decoded_output) # (batch, target_seq_len, vocab_size)
+        return logits
 
 
 ###########################################################################
@@ -842,14 +883,120 @@ def test_transformer_decoder():
     assert decoder_output.shape == (batch, target_seq_len, d_model), "Decoder tower failed to maintain exact spatial/channel geometry constraints." 
     assert decoder_output.dtype == jnp.bfloat16, "Precision unexpectedly leaked during deep propogation through 6 decoder blocks" 
     print("-> Decoder Tower computations works perfectly finee and flawless.")
+
+def TEST_TRANSFORMER(): 
+    """Final transformer block testing"""
     
-if __name__ =="__main__":
+    # parameters 
+    batch:int = 32
+    vocab_size:int = 32_000 
+    d_model:int = 512 
+    n_heads:int = 8 
+    d_ff:int = 2048 
+    pad_id:int = 1 
+    enc_n_layers:int = 6 
+    dec_n_layers:int = 6 
+    enc_max_len:int = 1024 
+    dec_max_len:int = 1024 
+    enc_dropout:float = 0.1 
+    dec_dropout:float = 0.1 
+    rngs = nn.Rngs(params=744, dropout=744) 
+
+    # initialising full model 
+    transformer = Transformer(
+        vocab_size=vocab_size, 
+        d_model=d_model, 
+        n_heads=n_heads, 
+        d_ff=d_ff, 
+        enc_n_layers=enc_n_layers, 
+        dec_n_layers=dec_n_layers, 
+        enc_max_len=enc_max_len, 
+        dec_max_len=dec_max_len, 
+        enc_dropout=enc_dropout, 
+        dec_dropout=dec_dropout, 
+        rngs=rngs, 
+        dtype=jnp.bfloat16
+    )
+
+    # generate dummy input data 
+    key = jax.random.PRNGKey(744) 
+    key_src, key_tgt, key_mask = jax.random.split(key, 3)
+
+    # source tokens (english)
+    source_ids = jax.random.randint(
+        key = key_src, 
+        shape = (batch, enc_max_len), 
+        minval = 0, 
+        maxval = vocab_size, 
+        dtype = jnp.int32
+    )
+
+    # target tokens (hindi)
+    target_ids = jax.random.randint(
+        key = key_tgt, 
+        shape = (batch, dec_max_len), 
+        minval = 0, 
+        maxval = vocab_size, 
+        dtype = jnp.int32
+    )
+
+
+    # generating padding masks (pad_id = 1)
+    source_padding_mask = (source_ids != pad_id)[:, jnp.newaxis, jnp.newaxis, :] # shape: (batch, 1, 1, enc_max_len)
+    target_padding_mask = (target_ids != pad_id)[:, jnp.newaxis, jnp.newaxis, :] # shape: (batch, 1, 1, dec_max_len)
+
+    print("=== Complete Transformer Pass ===")
+    print(f"Source Input Shape (B, max_seq_len) : {source_ids.shape}")
+    print(f"Target Input Shape (B, max_seq_len) : {target_ids.shape}") 
+    print(f"Source padding mask shape : {source_padding_mask.shape}")
+    print(f"Target padding mask shape : {target_padding_mask.shape}")
+
+    # complete forward pass 
+    # this outputs raw non-normalized logits representing likelihood array of next-token dictionary matches 
+    logits = transformer(
+        source = source_ids, 
+        target = target_ids, 
+        source_padding_mask = source_padding_mask, 
+        target_padding_mask = target_padding_mask, 
+        deterministic = False # since this is not an inference run and we need dropout
+    )
+
+    print(f"Final Logits Output (batch, max_seq_len, vocab_size) : {logits.shape} | dtype : {logits.dtype}")
+    
+    # parameter stats of this model 
+    state = nn.state(transformer, nn.Param)
+    num_params = sum(leaf.size for leaf in jax.tree_util.tree_leaves(state))
+    num_bytes = sum(leaf.nbytes for leaf in jax.tree_util.tree_leaves(state))
+    num_megabytes = num_bytes / 1024 / 1024
+
+    print(f"\nFull Transformer Model:")
+    print(f"Total Trainable Parameter             : {num_params:,}")
+    print(f"Memory Size (BF16)                    : {num_megabytes:2f} MB")
+
+    # assertions and bound checks 
+    assert logits.shape == (batch, dec_max_len, vocab_size), "Final Logits failed to map to vocabulary space"
+    assert logits.dtype == jnp.bfloat16, "Precision constraint violated in Generator Projection."
+    print("-> Full Transformer Architecture is functionally flawless and dimensionally consistent.")
+
+
+def test_all_block_sequentially():
     prettify = lambda : print("*"*50)
-    print("Testing Embedding Layer"); test_embedding_layer(); prettify()
-    print("Testing multi head attention"); test_mha(); prettify()
-    print("Testing Encoder Block"); test_encoder_block(); prettify()
-    print("Testing Full Encoder"); test_transformer_encoder(); prettify()
-    print("Testing Causal Multi-Head Attention"); test_causal_multihead_attention(); prettify()
-    print("Testing Cross-Attention"); test_cross_attention(); prettify()
-    print("Testing Decoder Block"); test_decoder_block(); prettify()
-    print("Testing Full Decoder"); test_transformer_decoder(); prettify()
+    # print("Testing Embedding Layer"); test_embedding_layer(); prettify()
+    # print("Testing multi head attention"); test_mha(); prettify()
+    # print("Testing Causal Multi-Head Attention"); test_causal_multihead_attention(); prettify()
+    # print("Testing Cross-Attention"); test_cross_attention(); prettify()
+    
+    # # Encoder testing code 
+    # print("Testing Encoder Block"); test_encoder_block(); prettify()
+    # print("Testing Full Encoder"); test_transformer_encoder(); prettify()
+
+    # # Decoder testing code
+    # print("Testing Decoder Block"); test_decoder_block(); prettify()
+    # print("Testing Full Decoder"); test_transformer_decoder(); prettify()
+
+    # Final transformer testing code
+    print("Testing Full Transformer"); TEST_TRANSFORMER(); prettify()
+
+if __name__ =="__main__":
+    # automatically tests all blocks
+    test_all_block_sequentially()
